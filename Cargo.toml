@@ -1,0 +1,15 @@
+[package]
+name = "fidgetsense-sample"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.47", features = ["derive"] }
+serial2 = "0.2.32"
+termion = "4.0.5"
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = true
+codegen-units = 1
