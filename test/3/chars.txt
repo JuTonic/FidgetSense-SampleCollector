@@ -1,4 +1,0 @@
-sex=m
-hand=r
-height=180
-

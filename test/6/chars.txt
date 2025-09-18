@@ -1,3 +1,0 @@
-sex=m
-hand=l
-height=170

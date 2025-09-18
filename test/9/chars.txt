@@ -1,3 +1,0 @@
-sex=f
-hand=l
-height=none
