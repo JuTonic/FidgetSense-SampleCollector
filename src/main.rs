@@ -1,11 +1,19 @@
 use clap::Parser;
+use rand::Rng;
 use serial2::SerialPort;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::path::Path;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::BufRead, path::PathBuf};
 use termion::input::TermRead;
+
+const WARMUP_LINE_COUNT: usize = 500; // how many serial lines to discard as warm-up
+const FLUSH_EVERY: usize = 5_000; // flush readings every N lines
+const DEFAULT_DEVICE_NAME: &str = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0";
+const DEFAULT_DIR: &str = ".";
+const BAUD: u32 = 115200;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -19,19 +27,15 @@ struct Args {
     dev: Option<PathBuf>,
 }
 
-const DEFAULT_DEVICE_NAME: &str = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0";
-const DEFAULT_DIR: &str = ".";
-const BAUD: u32 = 115200;
-
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
     let dev = args
         .dev
         .clone()
-        .unwrap_or(PathBuf::from(DEFAULT_DEVICE_NAME));
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DEVICE_NAME));
 
-    let port = SerialPort::open(dev, BAUD).map_err(|e| {
+    let port = SerialPort::open(&dev, BAUD).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -42,133 +46,38 @@ fn main() -> std::io::Result<()> {
         }
     })?;
 
-    let mut dir = args.dir.clone().unwrap_or(PathBuf::from(DEFAULT_DIR));
+    let base_dir = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
+    validate_dir(&base_dir)?;
 
-    if !dir.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "'{}' does not exist",
-                dir.to_str().unwrap_or("Failed to convert to string")
-            ),
-        ));
-    }
-    if !dir.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "'{}' is not a directory",
-                dir.to_str().unwrap_or("Failed to convert to string")
-            ),
-        ));
-    }
+    let sex = prompt_choice("sex (f/m): ", &["f", "m"], None)?;
+    let hand = prompt_choice("hand (l/R): ", &["l", "r"], Some("r"))?;
+    let height = prompt_height("height (in cm): ")?;
 
-    let mut sex = String::new();
-    print!("sex (f/m): ");
-    io::stdout().flush()?;
-    loop {
-        io::stdin().read_line(&mut sex)?;
-        sex = sex.trim().to_lowercase();
-        if sex == "f" || sex == "m" {
-            break;
-        } else {
-            eprint!("Sex must be either 'f' or 'm'. Try again: ");
-            io::stderr().flush()?;
-        }
-        sex.clear();
-    }
-
-    let mut hand = String::new();
-    print!("hand (l/R): ");
-    io::stdout().flush()?;
-    loop {
-        io::stdin().read_line(&mut hand)?;
-
-        if hand.trim().is_empty() {
-            hand = "r".to_string();
-        }
-
-        hand = hand.trim().to_lowercase();
-        if hand == "l" || hand == "r" {
-            break;
-        } else {
-            eprint!("hand must be either 'l' or 'r'. Try again: ");
-            io::stderr().flush()?;
-        }
-        hand.clear();
-    }
-
-    let mut height = String::new();
-    print!("height (in cm): ");
-    io::stdout().flush()?;
-    loop {
-        io::stdin().read_line(&mut height)?;
-
-        if height.trim().is_empty() {
-            break;
-        }
-
-        match height.trim().parse::<i32>() {
-            Ok(parsed_height) => {
-                if parsed_height > 300 || parsed_height < 50 {
-                    eprint!("You sure? Height must be between 50 and 300cm. Try again: ");
-                    io::stderr().flush()?;
-                    continue;
-                }
-                break;
-            }
-            Err(_) => {
-                eprint!("Height must be a valid integer. Try again: ");
-                io::stderr().flush()?;
-            }
-        }
-
-        height.clear();
-    }
-
-    let mut current_index = 1;
-
-    let entries = fs::read_dir(&dir)?;
-    for entry in entries {
-        match entry {
-            Ok(_) => current_index += 1,
-            Err(e) => eprintln!("Error reading entry: {}", e),
-        }
-    }
-
-    dir.push(format!("{}", current_index));
-
-    match fs::create_dir(&dir) {
-        Ok(_) => println!(
-            "New record: {}",
-            dir.to_str().unwrap_or("Failed to convert")
-        ),
-        Err(e) => panic!("{:?}", e),
-    }
-
-    let char_file = dir.join("chars.txt");
-    let mut char_file = File::create(char_file)?;
-    let _ = writeln!(char_file, "sex={}\nhand={}\nheight={}", sex, hand, height);
-
+    let recording_dir = next_numeric_subdir(&base_dir)?;
+    fs::create_dir(&recording_dir)?;
     println!(
-        "\nPress 't' for 'typing', 's' for 'scrolling', 'f' for 'fidgeting' and 'n' for 'nothing' (default)"
+        "New record: {}",
+        recording_dir.to_str().unwrap_or("Failed to convert")
     );
 
-    let label_file_path = dir.join("labels.csv");
+    let char_file = recording_dir.join("chars.txt");
+    let mut char_file = File::create(char_file)?;
+    let _ = writeln!(
+        char_file,
+        "sex={}\nhand={}\nheight={}",
+        sex,
+        hand,
+        height.unwrap_or("none".to_string())
+    );
+
+    let label_file_path = recording_dir.join("labels.csv");
     let mut label_file = File::create(label_file_path)?;
 
     thread::spawn(move || {
-        let start = SystemTime::now();
-        let timestamp;
-
-        match start.duration_since(UNIX_EPOCH) {
-            Ok(duration) => {
-                // Get the seconds part of the duration
-                timestamp = duration.as_millis();
-            }
-            Err(e) => panic!("{:?}", e),
-        }
-        let _ = writeln!(label_file, "{};n", timestamp);
+        let _ = writeln!(label_file, "{};n", now_ms());
 
         let stdin = io::stdin();
         for key in stdin.keys() {
@@ -178,31 +87,22 @@ fn main() -> std::io::Result<()> {
             }
             let key = key.unwrap();
 
-            let start = SystemTime::now();
-            let timestamp;
-
-            match start.duration_since(UNIX_EPOCH) {
-                Ok(duration) => {
-                    // Get the seconds part of the duration
-                    timestamp = duration.as_millis();
-                }
-                Err(e) => panic!("{:?}", e),
-            }
+            let now = now_ms();
             match key {
                 termion::event::Key::Char('t') => {
-                    let _ = writeln!(label_file, "{};t", timestamp);
+                    let _ = writeln!(label_file, "{};t", now);
                     println!("Typing")
                 }
                 termion::event::Key::Char('s') => {
-                    let _ = writeln!(label_file, "{};s", timestamp);
+                    let _ = writeln!(label_file, "{};s", now);
                     println!("Scrolling")
                 }
                 termion::event::Key::Char('f') => {
-                    let _ = writeln!(label_file, "{};f", timestamp);
+                    let _ = writeln!(label_file, "{};f", now);
                     println!("Fidgeting")
                 }
                 termion::event::Key::Char('n') => {
-                    let _ = writeln!(label_file, "{};n", timestamp);
+                    let _ = writeln!(label_file, "{};n", now);
                     println!("Nothing")
                 }
                 termion::event::Key::Char('q') => {
@@ -214,7 +114,7 @@ fn main() -> std::io::Result<()> {
         }
     });
 
-    let readings_file_path = dir.join("readings.csv");
+    let readings_file_path = recording_dir.join("readings.csv");
     let readings_file = File::create(readings_file_path)?;
 
     let mut buffered_writer = BufWriter::new(readings_file);
@@ -233,7 +133,7 @@ fn main() -> std::io::Result<()> {
                 break;
             }
             Ok(_) => {
-                if skip_first_three < 500 {
+                if skip_first_three < WARMUP_LINE_COUNT {
                     skip_first_three += 1;
                     continue;
                 }
@@ -249,7 +149,7 @@ fn main() -> std::io::Result<()> {
                 }
                 if !line.trim().is_empty() {
                     write!(buffered_writer, "{};{}", timestamp, line)?;
-                    if counter >= 5000 {
+                    if counter > FLUSH_EVERY {
                         buffered_writer.flush()?;
                     }
                 }
@@ -264,4 +164,94 @@ fn main() -> std::io::Result<()> {
     buffered_writer.flush()?;
 
     Ok(())
+}
+
+fn validate_dir(dir: &Path) -> io::Result<()> {
+    if !dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "'{}' does not exist",
+                dir.to_str().unwrap_or("Failed to convert to string")
+            ),
+        ));
+    }
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "'{}' is not a directory",
+                dir.to_str().unwrap_or("Failed to convert to string")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn next_numeric_subdir(base_dir: &Path) -> io::Result<PathBuf> {
+    let mut current_index = 1;
+
+    let entries = fs::read_dir(&base_dir)?;
+    for entry in entries {
+        match entry {
+            Ok(_) => current_index += 1,
+            Err(e) => eprintln!("Error reading entry: {}", e),
+        }
+    }
+
+    Ok(base_dir.join(current_index.to_string()).to_path_buf())
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis()
+}
+
+fn prompt_choice(prompt: &str, allowed: &[&str], default_opt: Option<&str>) -> io::Result<String> {
+    let mut input = String::new();
+    loop {
+        print!("{}", prompt);
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        let mut s = input.trim().to_lowercase();
+        if s.is_empty() {
+            if let Some(d) = default_opt {
+                s = d.to_string();
+            }
+        }
+        if allowed.contains(&s.as_str()) {
+            return Ok(s);
+        } else {
+            eprint!("Invalid input. Expected one of {:?}. Try again.\n", allowed);
+            io::stderr().flush()?;
+        }
+    }
+}
+
+fn prompt_height(prompt: &str) -> io::Result<Option<String>> {
+    let mut input = String::new();
+    loop {
+        print!("{}", prompt);
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        let s = input.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        match s.parse::<i32>() {
+            Ok(h) if (50..=300).contains(&h) => return Ok(Some(h.to_string())),
+            Ok(_) => {
+                eprint!("You sure? Height must be between 50 and 300cm. Try again: \n");
+                io::stderr().flush()?;
+            }
+            Err(_) => {
+                eprint!("Height must be a valid integer. Try again: \n");
+                io::stderr().flush()?;
+            }
+        }
+    }
 }

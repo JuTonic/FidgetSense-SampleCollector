@@ -1,0 +1,4 @@
+sex=f
+hand=r
+height=175
+
