@@ -1,19 +1,57 @@
 use clap::Parser;
-use rand::Rng;
+use crossterm::style::Print;
+use crossterm::terminal::ClearType;
+use crossterm::{cursor, execute, terminal};
+use figlet_rs::FIGfont;
+use rand::prelude::*;
 use serial2::SerialPort;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Stdout, Write};
 use std::path::Path;
+use std::sync::LazyLock;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io::BufRead, path::PathBuf};
-use termion::input::TermRead;
 
 const WARMUP_LINE_COUNT: usize = 500; // how many serial lines to discard as warm-up
 const FLUSH_EVERY: usize = 5_000; // flush readings every N lines
 const DEFAULT_DEVICE_NAME: &str = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0";
 const DEFAULT_DIR: &str = ".";
 const BAUD: u32 = 115200;
+
+static FIGFONT: LazyLock<FIGfont> =
+    LazyLock::new(|| FIGfont::standard().expect("Failed to load FIGfont"));
+const COUNTDOWN_DURATION_SEC: Duration = Duration::from_secs(1);
+const COUNTDOWN_FROM: u32 = 5;
+const ACTIVITY_DURATION_SEC: Duration = Duration::from_secs(15);
+
+const TEXTS: [&str; 5] = [
+    "The tortoise and the hare are often seen as representing two different approaches to life. The hare is fast and confident, often rushing ahead, while the tortoise is slow and steady, never losing focus. In the end, the tortoise won the race because it was consistent and patient.",
+    "Humans have always been fascinated by the stars. We’ve sent spacecraft to distant planets, launched satellites to explore our solar system, and studied the cosmos through telescopes. One day, we may even establish colonies on Mars, but for now, we can only imagine the future of space exploration",
+    "The butterfly effect is a concept in chaos theory that suggests that small causes can have large effects. It’s based on the idea that the flap of a butterfly’s wings in one part of the world could set off a chain of events leading to significant changes in another part of the world. It highlights the interconnectedness of all things.",
+    "Cooking is both a science and an art. From the precise measurements of ingredients to the creativity of combining flavors, there’s something deeply satisfying about preparing a meal. Whether you're baking a cake or grilling a steak, cooking allows for endless experimentation, and every dish is a reflection of the cook’s personality.",
+    "Music has the power to transport us to another time and place. It can evoke memories, stir emotions, and bring people together. From classical compositions to modern pop songs, music is a universal language that transcends borders and connects us to something greater than ourselves.",
+];
+
+#[derive(Clone, Debug)]
+enum Activity {
+    NOTHING,
+    TYPING,
+    SCROLLING,
+    FIDGETING,
+    OTHER,
+}
+
+const ACTIVITIES_ARR: [Activity; 8] = [
+    Activity::NOTHING,
+    Activity::NOTHING,
+    Activity::TYPING,
+    Activity::TYPING,
+    Activity::SCROLLING,
+    Activity::SCROLLING,
+    Activity::FIDGETING,
+    Activity::FIDGETING,
+];
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -77,41 +115,22 @@ fn main() -> std::io::Result<()> {
     let mut label_file = File::create(label_file_path)?;
 
     thread::spawn(move || {
-        let _ = writeln!(label_file, "{};n", now_ms());
+        let mut out = io::stdout();
+        let mut rng = rand::rng();
 
-        let stdin = io::stdin();
-        for key in stdin.keys() {
-            if key.is_err() {
-                eprintln!("Failed to capture the pressing of a key!");
-                continue;
-            }
-            let key = key.unwrap();
+        let mut activities: [Activity; 8] = ACTIVITIES_ARR.clone();
+        activities.shuffle(&mut rng);
 
-            let now = now_ms();
-            match key {
-                termion::event::Key::Char('t') => {
-                    let _ = writeln!(label_file, "{};t", now);
-                    println!("Typing")
-                }
-                termion::event::Key::Char('s') => {
-                    let _ = writeln!(label_file, "{};s", now);
-                    println!("Scrolling")
-                }
-                termion::event::Key::Char('f') => {
-                    let _ = writeln!(label_file, "{};f", now);
-                    println!("Fidgeting")
-                }
-                termion::event::Key::Char('n') => {
-                    let _ = writeln!(label_file, "{};n", now);
-                    println!("Nothing")
-                }
-                termion::event::Key::Char('q') => {
-                    println!("Exiting...");
-                    break;
-                }
-                _ => {}
-            }
+        for activity in activities {
+            write_label_to_file(&Activity::OTHER, &mut label_file);
+            start_countdown(&activity, &mut out);
+            show_after_countdown_msg(&activity, &mut out);
+            write_label_to_file(&activity, &mut label_file);
+            thread::sleep(ACTIVITY_DURATION_SEC);
         }
+
+        write_label_to_file(&Activity::OTHER, &mut label_file);
+        print_msg("Done!\nYou are amazing!".to_string(), &mut out);
     });
 
     let readings_file_path = recording_dir.join("readings.csv");
@@ -137,25 +156,15 @@ fn main() -> std::io::Result<()> {
                     skip_first_three += 1;
                     continue;
                 }
-                let start = SystemTime::now();
-                let timestamp;
-
-                match start.duration_since(UNIX_EPOCH) {
-                    Ok(duration) => {
-                        // Get the seconds part of the duration
-                        timestamp = duration.as_millis();
-                    }
-                    Err(e) => panic!("{:?}", e),
-                }
                 if !line.trim().is_empty() {
-                    write!(buffered_writer, "{};{}", timestamp, line)?;
+                    write!(buffered_writer, "{};{}", now_ms(), line)?;
                     if counter > FLUSH_EVERY {
                         buffered_writer.flush()?;
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("Error reading line: {}", e);
+            Err(_) => {
+                // eprintln!("Error reading line: {}", e);
             }
         }
         counter += 1;
@@ -254,4 +263,84 @@ fn prompt_height(prompt: &str) -> io::Result<Option<String>> {
             }
         }
     }
+}
+
+fn start_countdown(activity: &Activity, out: &mut Stdout) -> io::Result<()> {
+    execute!(out, cursor::Hide)?;
+
+    let activity_msg = get_before_activity_msg(activity);
+
+    for n in (1..=COUNTDOWN_FROM).rev() {
+        let number_str = n.to_string();
+        print_msg(activity_msg.to_string() + " " + &number_str, out)?;
+        thread::sleep(COUNTDOWN_DURATION_SEC);
+    }
+
+    Ok(())
+}
+
+fn get_before_activity_msg(activity: &Activity) -> String {
+    match activity {
+        Activity::TYPING => "Prepare to type!",
+        Activity::NOTHING => "Prepare to nothing!",
+        Activity::SCROLLING => "Prepare to scroll!",
+        Activity::FIDGETING => "Prepare to fidget!",
+        Activity::OTHER => unreachable!(),
+    }
+    .to_string()
+}
+
+fn show_after_countdown_msg(activity: &Activity, out: &mut Stdout) -> io::Result<()> {
+    match activity {
+        Activity::TYPING => {
+            let mut rng = rand::rng();
+
+            let text = TEXTS.choose(&mut rng).unwrap();
+
+            execute!(
+                out,
+                terminal::Clear(ClearType::All),
+                cursor::MoveTo(0, 0),
+                Print("Retype this:\n\n"),
+                Print(text),
+                cursor::MoveToNextLine(2),
+                cursor::Show
+            )?;
+
+            Ok(())
+        }
+        Activity::NOTHING => print_msg("Do nothing!".to_string(), out),
+        Activity::SCROLLING => print_msg("Scroll!".to_string(), out),
+        Activity::FIDGETING => print_msg("Fidget!".to_string(), out),
+        Activity::OTHER => unreachable!(),
+    }
+}
+
+fn print_msg(msg: String, out: &mut Stdout) -> io::Result<()> {
+    execute!(out, cursor::Hide)?;
+
+    let figure = FIGFONT.convert(&msg).unwrap();
+
+    execute!(
+        out,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0),
+        Print(figure.to_string())
+    )?;
+
+    out.flush()?;
+
+    Ok(())
+}
+
+fn write_label_to_file(activity: &Activity, file: &mut File) -> io::Result<()> {
+    let s = match activity {
+        Activity::TYPING => "t",
+        Activity::SCROLLING => "s",
+        Activity::FIDGETING => "f",
+        Activity::NOTHING => "n",
+        Activity::OTHER => "o",
+    };
+    writeln!(file, "{};{}", now_ms(), s)?;
+    Ok(())
 }
